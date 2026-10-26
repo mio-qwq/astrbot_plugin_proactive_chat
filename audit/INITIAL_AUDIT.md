@@ -42,19 +42,19 @@ No application source code was modified during this audit pass.
 - Impact: These settings cannot be persisted through this global editor path; UI may display inconsistently or not expose them.
 - Next: API/UI contract tests and inspect full render path.
 
-### A-05 — Manual trigger has a check-then-set race window
-- Severity: Medium (concurrency/correctness)
-- Confidence: Strong static finding
-- Evidence: `POST /api/jobs/{umo:path}/trigger` checks `manual_trigger_sessions`, then adds the session without a lock, then schedules `plugin.check_and_chat()`.
-- Impact: Concurrent requests may both pass the check and schedule duplicate immediate triggers.
-- Next: Concurrent API test with a barrier; consider per-session lock or atomic guard.
+### A-05 — Manual-trigger guard is synchronous, so the suspected race is not established
+- Severity: Withdrawn pending new evidence
+- Confidence: Initial concern falsified by control-flow inspection
+- Evidence: The route checks `manual_trigger_sessions` and immediately adds the session without an intervening `await`. Under normal single-event-loop asyncio scheduling, another coroutine cannot interleave between those operations.
+- Impact: Do not count this as a confirmed race. A lock is not justified solely by this snippet; test thread-level access or future edits only if relevant.
+- Next: Keep as a negative finding; verify task creation and cleanup separately.
 
-### A-06 — Manual-trigger cleanup may not be wired into the request task
-- Severity: Medium (status/duplicate-trigger lifecycle)
-- Confidence: Needs full call-path verification
-- Evidence: Endpoint registers `plugin.check_and_chat(normalized)` directly. `FlowOrchestrator.clear_manual_trigger_state()` exists, but inspected default pipeline/endpoint did not visibly show a `finally` that clears the marker.
-- Impact: If no other path clears it, session may remain marked in-progress after completion and future triggers return 409.
-- Next: Trace all references and test success, exception, cancellation, shutdown before elevating to confirmed.
+### A-06 — Manual-trigger cleanup is wired through the orchestrator
+- Status: Not a confirmed bug; initial concern resolved
+- Confidence: Confirmed by call-path inspection
+- Evidence: `main.py::check_and_chat()` calls `FlowOrchestrator.run()`, whose `finally` calls `clear_manual_trigger_state(normalized_session_id)`.
+- Caveat: The early `_terminating` return occurs before the `try/finally`, but shutdown is already in progress. This should be tested for stale UI state only if it affects restart/runtime behavior.
+- Next: Remove from the bug list; retain a lifecycle regression test.
 
 ### A-07 — Session state writes are non-atomic
 - Severity: Medium (durability)
@@ -185,3 +185,45 @@ No application source code was modified during this audit pass.
 ## Scope boundary
 
 This dossier is a working audit record, not a final security certification. No production source files were changed. Findings marked 'needs validation' must be reproduced or falsified before implementation.
+
+### A-21 — Session-state loading validates only the root JSON type
+- Severity: Medium (robustness / recovery)
+- Confidence: Confirmed
+- Evidence: `core/store/session_store.py::load()` accepts any JSON object as the entire session store. It does not validate that every value is a mapping or that fields have expected types before returning it.
+- Impact: A partially malformed but syntactically valid file can later break normalization/scheduler paths that assume each session payload is a dict. The current exception handling catches JSON parse and OS errors, not downstream shape errors.
+- Next: Add per-entry schema validation and tests with lists/scalars/missing fields/invalid numeric types.
+
+### A-22 — Login endpoint has no visible brute-force throttling
+- Severity: Low–Medium (deployment-dependent)
+- Confidence: Confirmed in inspected route; exploitability depends on network exposure
+- Evidence: `POST /api/login` compares the supplied password using `secrets.compare_digest` and issues a token on success, but the inspected route has no per-IP or global rate limit/backoff.
+- Impact: If the console is reachable from a LAN or other untrusted network, password guessing is not rate-limited at the application layer.
+- Next: Test deployment exposure; add rate limiting or document reverse-proxy protections if remote access is supported.
+
+### A-23 — WebSocket token is exposed to browser URL construction and may leak in infrastructure logs
+- Severity: Low–Medium
+- Confidence: Confirmed
+- Evidence: `admin/js/hooks/useWebSocket.js` appends the bearer token as `?token=...`; server accepts query token first.
+- Impact: Reverse proxies, debug tooling, or URL logging can record the token. The default server disables Uvicorn access logs, which reduces but does not eliminate deployment-specific risk.
+- Next: Prefer Authorization header for WebSocket where clients/proxies support it, or ensure query strings are redacted at every proxy/logging layer.
+
+### A-24 — Custom regex configuration can cause excessive CPU during message segmentation
+- Severity: Low–Medium (user-controlled configuration; denial-of-service risk)
+- Confidence: Plausible, not reproduced
+- Evidence: `core/services/sender_service.py::split_text()` compiles and runs a user-configurable regular expression with `re.findall` over the full response. Invalid regex syntax is caught, but catastrophic backtracking is not bounded by Python's standard `re` API.
+- Impact: A pathological configured pattern plus long model output may block the event loop while regex evaluation runs.
+- Next: Reproduce with bounded local test inputs; cap text length and/or use a timeout-capable regex engine or simpler splitting modes.
+
+### A-25 — Config editor's numeric input can persist transient empty/invalid values inconsistently
+- Severity: Low (UI correctness)
+- Confidence: Confirmed behavior in source; impact needs UI test
+- Evidence: `ConfigRenderer.jsx` allows `''` and `'-'` into local state without calling `handleChange`, while the parent config object retains the prior numeric value. On blur/save, displayed input and saved value can disagree.
+- Impact: A user can see an empty or incomplete number while the persisted draft still contains an older value; behavior is confusing and can cause accidental saves.
+- Next: Add component tests for clearing, typing a minus sign, blur, switching sessions, and save.
+
+### A-26 — Global config schema and API contract are structurally inconsistent
+- Severity: Medium (configuration correctness / maintainability)
+- Confidence: Confirmed
+- Evidence: The schema contains top-level `friend_settings`, `group_settings`, `web_admin`, `notification_settings`, and `telemetry_config`; GET config omits telemetry, while POST accepts only the first three groups. The renderer uses all top-level schema entries in global mode.
+- Impact: Some schema-described fields can be rendered with defaults but cannot be loaded or persisted through the matching API. This is broader than a single missed checkbox and indicates schema/API drift.
+- Next: Define one canonical configuration contract and test every schema root key against GET/POST behavior.
