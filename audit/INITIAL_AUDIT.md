@@ -63,12 +63,12 @@ No application source code was modified during this audit pass.
 - Impact: Process termination or disk failure mid-write can leave truncated JSON; startup then falls back to empty state after parse failure.
 - Next: Fault-injection test; consider temp-file + fsync/replace.
 
-### A-08 — Shared lock discipline needs a complete audit
-- Severity: Medium (race/lost update risk)
-- Confidence: Strong static concern; not yet fully mapped
-- Evidence: Some paths mutate/save `session_data` inside `plugin.data_lock`, but search results also show save paths whose lock ownership needs verification. A complete mutation/caller inventory has not yet been built.
-- Impact: Concurrent event handlers and scheduler tasks may serialize overlapping snapshots or interleave state transitions.
-- Next: Enumerate all mutations and `save_data()` callers; document lock ownership before refactoring.
+### A-08 — Shared lock discipline remains a verification task, not a confirmed defect
+- Severity: Unrated pending complete inventory
+- Confidence: Initial concern weakened by call-site review
+- Evidence: The inspected `save_data()` call sites mostly show an enclosing `plugin.data_lock`; the service explicitly documents that the store save is an unlocked internal operation whose callers own synchronization.
+- Impact: No concrete unlocked mutation/save race has been demonstrated so far. Do not claim a bug until every caller and mutation path has been inventoried.
+- Next: Build a complete mutation/lock ownership map before refactoring; retain as an audit task, not a confirmed finding.
 
 ### A-09 — WebSocket heartbeat/reconnect has known edge cases in upstream PR #114
 - Severity: Medium (admin UI reliability)
@@ -227,3 +227,44 @@ This dossier is a working audit record, not a final security certification. No p
 - Evidence: The schema contains top-level `friend_settings`, `group_settings`, `web_admin`, `notification_settings`, and `telemetry_config`; GET config omits telemetry, while POST accepts only the first three groups. The renderer uses all top-level schema entries in global mode.
 - Impact: Some schema-described fields can be rendered with defaults but cannot be loaded or persisted through the matching API. This is broader than a single missed checkbox and indicates schema/API drift.
 - Next: Define one canonical configuration contract and test every schema root key against GET/POST behavior.
+
+
+## Upstream history and regression signals
+
+The public upstream issue/PR history was reviewed as supporting context. These are not proof that current code is broken, but they help prioritize regression coverage:
+
+- Issue #103 reports a v1.2.5 release ZIP whose WebUI showed a blank page because a referenced JS file returned 404; replacing the bundled admin directory fixed it. This is direct evidence that release packaging needs browser smoke tests, not only source-tree checks.
+- Issue #105 reports persisted scheduling tasks failing to restore when plugin startup happened before a custom-ID platform adapter initialized. The current lifecycle code contains delayed startup/retry logic, but this scenario deserves a regression test.
+- Issue #88 reports AstrBot event handler signature incompatibility after a host upgrade; the adapter boundary should be tested against supported host versions.
+- Issue #75 reports host process crash around configuration hot reload/port conflict; current server has port probing, but hot-reload behavior still deserves an integration test.
+- Issue #69/#68/#57/#66 show historical dependency and FastAPI/Starlette compatibility failures. The current broad lower bounds in `requirements.txt` make a supported dependency matrix and upper-bound policy worth considering.
+- PR #114 is an open, unmerged WebUI refactor. Review comments reported stale configuration request state, WebSocket heartbeat/reconnect edge cases, mobile scroll restoration, and cache headers. These are **PR-only reports unless verified on the audited baseline**.
+- The current CI run for the audited baseline showed Ruff and release packaging workflows, but no automated test workflow was visible. The repo's recent major refactor was very large, making characterization tests especially important.
+
+## Architecture assessment
+
+The architecture is not simply random spaghetti. The backend has coherent module categories and recognizable seams. However, the current abstractions are not yet demonstrated by tests or contracts:
+
+1. `ProactiveChatPlugin` is effectively a service container and shared mutable-state owner; this makes cross-service coupling easy and synchronization assumptions implicit.
+2. The pipeline is extensible at the Stage/Feature level, but default features reach back through the orchestrator into the whole plugin container. That limits true isolation and makes unit testing require large mocks.
+3. Scheduler, persistence, message history and UI state share session identifiers and implicit timing invariants. Those invariants are spread across event handlers, scheduler methods, and the orchestrator rather than defined in one state machine.
+4. Configuration schema, API payloads and UI save logic are maintained separately and have already drifted (A-04/A-26).
+5. Remote notifications, telemetry, and core proactive-chat behavior are constructed together during plugin initialization. Optional remote features should not make the local core harder to reason about.
+6. The UI is built around global browser objects and manually queued scripts rather than a conventional module graph. This can work, but increases reliance on load ordering, generated artifacts and hand-maintained string rewrites.
+
+### Recommended refactor target (not implemented)
+
+- Define typed domain models for session state, configuration, trigger result, and delivery result.
+- Give each session an explicit state machine with idempotent transitions for: idle → scheduled → generating → review → delivering → persisted/rescheduled, plus cancellation/failure.
+- Isolate scheduler and clock behind interfaces so time and races can be tested deterministically.
+- Make persistence a single owner of serialization and atomic replacement; do not let arbitrary services write raw mutable dictionaries.
+- Make configuration schema the source of truth for validation and API contract; add round-trip tests for every top-level group.
+- Make telemetry and remote notifications independent opt-in services with explicit data inventory, no prompt/config secrets by default, and runtime-safe disable semantics.
+- Keep a modular architecture only where module boundaries can be tested independently; avoid adding more abstractions until each one has an enforceable contract.
+
+## Findings that were explicitly downgraded or withdrawn
+
+- The suspected manual-trigger check/set race (A-05) is not supported by the current code path because there is no `await` between check and add in a single asyncio event loop.
+- The suspected missing manual-trigger cleanup (A-06) is resolved by the orchestrator's `finally` block.
+- The shared-lock concern (A-08) remains a code-audit task; current call-site evidence does not establish an unlocked save race.
+- Markdown XSS (A-20), regex ReDoS (A-24), and reschedule-ordering issues (A-17) remain hypotheses requiring targeted reproduction, not confirmed vulnerabilities.
